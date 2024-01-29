@@ -4247,6 +4247,31 @@ def test_solver_yanked_warning(
     assert error.count("Reason for being yanked") == 1
 
 
+@pytest.mark.benchmark
+def test_performance(
+    package: ProjectPackage,
+    pool: RepositoryPool,
+    repo: Repository,
+    benchmark: Any,
+) -> None:
+    package.add_dependency(Factory.create_dependency("A", ">=45.0.0,<455.0.0"))
+    package.add_dependency(Factory.create_dependency("C", "*"))
+    repo.add_package(get_package("C", "1.0.0"))
+    repo.add_package(get_package("B", "48.0.0"))
+
+    package_a = get_package("A", "1.0.0")
+    for i in range(500):
+        pkg = get_package("A", f"{str(i)}.0.0")
+        repo.add_package(pkg)
+        pkg.add_dependency(Factory.create_dependency("B", f">={str(i)}.0.0"))
+    
+    solver = Solver(package, pool, [], [], NullIO())
+    solver.solve()
+    #assert False
+    #transaction = benchmark(solver.solve)
+    #assert benchmark.stats.stats.median < 100e-4
+
+
 @pytest.mark.parametrize("is_locked", [False, True])
 def test_update_with_use_latest_vs_lock(
     package: ProjectPackage,

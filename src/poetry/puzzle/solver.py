@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 from typing import FrozenSet
 from typing import Tuple
 from typing import TypeVar
-
 from poetry.mixology import resolve_version
 from poetry.mixology.failure import SolveFailure
 from poetry.puzzle.exceptions import OverrideNeeded
@@ -152,9 +151,83 @@ class Solver:
             self._overrides.append(self._provider._overrides)
 
         try:
-            result = resolve_version(self._package, self._provider)
+            def _safe_get_version(release: Release) -> Tuple[int, int, int]:
+                return release.major, release.minor if release.minor else 0, release.patch if release.patch else 0
 
-            packages = result.packages
+            def _create_z3_constraint_root_pkg(release: Release, include_version: bool) -> None:
+                major_v, minor_v, patch_v = _safe_get_version(release)
+                opr_fnc = operator.le if include_version else operator.lt
+                s.add(z3.Implies(major==major_v and minor==minor_v, opr_fnc(patch, patch_v)))
+                s.add(z3.Implies(major==major_v and minor!=minor_v, operator.lt(minor, minor_v)))
+                s.add(z3.Implies(major!=major_v, operator.lt(major, major_v)))
+
+            def _create_z3_constraint_dep(release: Release, dep: Release, include_version: bool, major_dep: z3.Int, minor_dep: z3.Int, patch_dep: z3.Int) -> None:
+                major_v, minor_v, patch_v = _safe_get_version(release)
+                major_dep_v, minor_dep_v, patch_dep_v = _safe_get_version(dep)
+                opr_fnc = operator.le if include_version else operator.lt
+                s.add(z3.Implies(major==major_v and minor==minor_v and patch == patch_v and major_dep==major_dep_v and minor_dep==minor_dep_v, opr_fnc(patch_dep, patch_dep_v)))
+                s.add(z3.Implies(major==major_v and minor==minor_v and patch == patch_v and major_dep==major_dep_v and minor_dep!=minor_dep_v, operator.lt(minor_dep, minor_dep_v)))
+                s.add(z3.Implies(major==major_v and minor==minor_v and patch == patch_v and major_dep!=major_dep_v, operator.lt(major_dep, major_dep_v)))
+            def _process_dep(req: Dependency) -> None:
+                for pkg in self._provider.search_for(req):
+                    for dep in self._provider.complete_package(pkg).package.requires:
+                        dependency.append(dep)
+                        major_dep, minor_dep, patch_dep = z3.Int(f"{dep.name};major"), z3.Int(f"{dep.name};minor"), z3.Int(f"{dep.name};patch")
+                        dep_version = self._provider.complete_package(pkg).package.version
+                        if dep_version.allowed_max and dep_version.allowed_max.release:
+                            _create_z3_constraint_dep(req.constraint.allowed_max.release, dep_version.allowed_max.release, dep_version.include_max, major_dep, minor_dep, patch_dep)
+                        if dep_version.allowed_min and dep_version.allowed_min.release:
+                            _create_z3_constraint_dep(req.constraint.allowed_min.release, dep_version.allowed_min.release, dep_version.include_min, major_dep, minor_dep, patch_dep)
+                        _process_dep(dep)
+            import z3
+            import operator
+            dependency = []
+            s = z3.Solver()
+            for req in self._package.all_requires:
+                major, minor, patch = z3.Int(f"{req.name};major"), z3.Int(f"{req.name};minor"), z3.Int(f"{req.name};patch")
+                dependency.append(req)
+                if req.constraint.allowed_max:
+                    _create_z3_constraint_root_pkg(req.constraint.allowed_max.release, req.constraint.include_max)
+                if req.constraint.allowed_min:
+                    _create_z3_constraint_root_pkg(req.constraint.allowed_min.release, req.constraint.include_min)
+                if not req.constraint.allowed_max and not req.constraint.allowed_min:
+                    s.add(major >= 0, minor >= 0, patch >=0)
+                _process_dep(req)
+            for d in dependency:
+                if self._provider.search_for(d):
+                    max_ma, max_mi, max_pat = 0, 0, 0
+                    name = ""
+                    for pkg in self._provider.search_for(d):
+                        name = pkg.package.complete_name
+                        ma, mi, pat = pkg.package.pretty_version.split(".")
+                        max_ma = max_ma if max_ma > int(ma) else int(ma)
+                        max_mi = max_mi if max_mi > int(mi) else int(mi)
+                        max_pat = max_pat if max_pat > int(mi) else int(pat)
+                    s.add(z3.Int(f"{name};major") <= max_ma,z3.Int(f"{name};minor") <= max_mi, z3.Int(f"{name};patch") <= max_pat)
+                    #s.add(z3.Int(f"{name};major") >= 0,z3.Int(f"{name};minor") >= 0, z3.Int(f"{name};patch") >= 0)
+
+
+            s.check()
+            m = s.model()
+            name_major = {}
+            name_minor = {}
+            name_patch = {}
+            for var in m:
+                text = str(var)
+                name, level = text.split(";")[0], text.split(";")[1]
+                if level == "major":
+                    name_major[name] = m[var]
+                if level == "minor":
+                    name_minor[name] = m[var]
+                if level == "patch":
+                    name_patch[name] = m[var]
+            for d in dependency:
+                packages = [pkg for pkg in self._provider.search_for(d) if f"{name_major[pkg.package.complete_name]}.{name_minor[pkg.package.complete_name]}.{name_patch[pkg.package.complete_name]}"== pkg.package.pretty_version]
+            
+            
+            #result = resolve_version(self._package, self._provider)
+
+            packages = [] #result.packages
         except OverrideNeeded as e:
             return self._solve_in_compatibility_mode(e.overrides)
         except SolveFailure as e:
